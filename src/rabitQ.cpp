@@ -1,8 +1,12 @@
 #include "rabitQ.hpp"
 #include "Eigen/Dense"
 #include "utils.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <queue>
+#include <spdlog/spdlog.h>
 
 bool rabitQ::train() {
   if (!std::filesystem::exists(data_path_)) {
@@ -59,7 +63,6 @@ bool rabitQ::save(const std::string &saved_path) { return false; }
 // TODO: Implement this function
 bool rabitQ::load(const std::string &index_path) { return false; }
 
-// TODO: Implement this function
 /**
  * @brief Load the float vectors from the data path
  *
@@ -68,7 +71,31 @@ bool rabitQ::load(const std::string &index_path) { return false; }
  * is the dimension of the vectors
  */
 rabitQ::Matrix rabitQ::loadFevcs(const std::string &data_path) {
-  return Matrix();
+  std::filesystem::path path(data_path);
+  if (!std::filesystem::exists(path)) {
+    spdlog::error("Data path does not exist.");
+    return Matrix();
+  }
+
+  // Load the data from the file
+  // The data is stored in the fvecs format
+  // The first 4 bytes are the dimension of the vector, remaining bytes are the
+  // float values
+  auto fio = std::ifstream(data_path, std::ios::binary);
+
+  Matrix data;
+  while (fio) {
+    auto dim = readInt32(fio);
+
+    if (dim == 0) {
+      break;
+    }
+    Eigen::MatrixXf vec(1, dim);
+    fio.read(reinterpret_cast<char *>(vec.data()), dim * sizeof(float));
+    data.conservativeResize(data.rows() + 1, dim);
+    data.row(data.rows() - 1) = vec;
+  }
+  return data;
 }
 
 // TODO: Implement this function
@@ -83,7 +110,160 @@ rabitQ::Matrix rabitQ::loadFevcs(const std::string &data_path) {
  */
 bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
                  std::vector<int> &indices) {
-  return false;
+
+  // random initialization of centroids
+  centroids = Matrix::Random(K, dimension_);
+
+  // perform k-means clustering
+  int max_iter = 100;
+  bool converged = false;
+
+  // TODO(tang-hi): add the corresponding data to the inverted list
+  while (!converged && max_iter > 0) {
+    // assign each vector to the nearest centroid
+    std::vector<int> counts(K, 0);
+    Matrix new_centroids = Matrix::Zero(K, dimension_);
+    for (int i = 0; i < vectors.rows(); ++i) {
+      float min_dist = std::numeric_limits<float>::max();
+      int min_idx = -1;
+      for (int j = 0; j < K; ++j) {
+        float dist = (vectors.row(i) - centroids.row(j)).squaredNorm();
+        if (dist < min_dist) {
+          min_dist = dist;
+          min_idx = j;
+        }
+      }
+      indices[i] = min_idx;
+      new_centroids.row(min_idx) += vectors.row(i);
+      counts[min_idx]++;
+    }
+
+    // update the centroids
+    for (int i = 0; i < K; ++i) {
+      if (counts[i] == 0) {
+        // if no vector is assigned to the centroid, reinitialize it
+        spdlog::warn(
+            "Centroid {} has no vectors assigned to it. Reinitializing", i);
+        centroids.row(i) = Matrix::Random(1, dimension_);
+      } else {
+        new_centroids.row(i) /= counts[i];
+        if ((new_centroids.row(i) - centroids.row(i)).norm() < 1e-6) {
+          converged = true;
+        } else {
+          converged = false;
+        }
+        centroids.row(i) = new_centroids.row(i);
+      }
+    }
+    max_iter--;
+  }
+
+  spdlog::info("IVF converged: {}, iteration times is {}", converged,
+               100 - max_iter);
+  return true;
+}
+
+auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
+  TopResult result;
+  auto PT = P_.transpose();
+
+  // convert the query to the transformed domain
+  Eigen::Map<Matrix> query_vec(query, 1, dimension_);
+  auto transformed_query = query_vec * PT;
+
+  // find the nearest centroid
+  TopResult nearest_centroids;
+  getNearestCentroids(nprobe, transformed_query, nearest_centroids);
+
+  while (!nearest_centroids.empty()) {
+    auto [negative_dist, centroid_idx] = nearest_centroids.top();
+    nearest_centroids.pop();
+    int residual_min;
+    float width;
+    int sum;
+    auto quantized_query = quantizeQuery(transformed_query, centroid_idx,
+                                         residual_min, width, sum);
+  }
+}
+
+auto rabitQ::quantizeQuery(const Matrix &query, int centroid_idx,
+                           int &residual_min, float &width, int &sum)
+    -> Matrix {
+  auto centroid = transformed_centroids_.row(centroid_idx);
+  auto residual_query = query.row(0) - centroid;
+  auto residual_query_min = residual_query.minCoeff();
+  auto residual_query_max = residual_query.maxCoeff();
+  width = (residual_query_max - residual_query_min) / ((1 << Bq_) - 1);
+  residual_min = residual_query_min;
+  BinaryMatrix quantized_query(1, dimension_);
+  for (int i = 0; i < dimension_; ++i) {
+    quantized_query(0, i) = static_cast<uint8_t>(
+        (residual_query(0, i) - residual_query_min) / width);
+
+    sum += quantized_query(0, i);
+  }
+  return quantized_query;
+}
+
+void rabitQ::scanCluster(const Matrix &query, float cluster_dist,
+                         int cluster_id, TopResult &result) {
+  constexpr int size = 32;
+  auto cluster_size = inverted_index_[cluster_id].size();
+  uint32_t i = 0;
+  for (; i < cluster_size; i += size) {
+    for (int j = 0; j < size; ++j) {
+      float tmp_dist =
+          data_dist_to_centroids_[inverted_index_[cluster_id][i + j]] +
+          cluster_dist + /* ptr_fac->factor_ppc */ residual_min +
+          /* (distance between quant_query and packed_codec * 2 - sumq ) */ 0 *
+              /* (ptr_fac->factor_ip)*/ width;
+
+      float error_bound = cluster_dist * 1 /* ptr_fac->error*/;
+    }
+  }
+
+  for (; i < cluster_size; ++i) {
+    float tmp_dist =
+        data_dist_to_centroids_[inverted_index_[cluster_id][i]] + cluster_dist +
+        /* ptr_fac->factor_ppc */ residual_min +
+        /* (distance between quant_query and packed_codec * 2 - sumq ) */ 0 *
+            /* (ptr_fac->factor_ip)*/ width;
+
+    float error_bound = cluster_dist * 1 /* ptr_fac->error*/;
+    if (result.size() < K) {
+      auto ground_truth =
+          query[0] *
+          transformed_data_.row(inverted_index_[cluster_id][i]).transpose();
+      result.push({-ground_truth(0, 0), inverted_index_[cluster_id][i]});
+    } else {
+      auto max_dist = -1 * result.top().second;
+      if ((tmp_dist - error_bound) < max_dist) {
+        auto ground_truth =
+            query[0] *
+            transformed_data_.row(inverted_index_[cluster_id][i]).transpose();
+        if (ground_truth(0, 0) < max_dist) {
+          result.pop();
+          result.push({-ground_truth(0, 0), inverted_index_[cluster_id][i]});
+        }
+      }
+    }
+  }
+}
+
+void rabitQ::getNearestCentroids(int nprobe, const Matrix &transformed_query,
+                                 TopResult &result) {
+  for (int i = 0; i < transformed_centroids_.rows(); ++i) {
+    float dist = (transformed_query - transformed_centroids_.row(i)).norm();
+    if (result.size() < nprobe) {
+      result.push({-dist, i});
+    } else {
+      auto max_dist = -1 * result.top().second;
+      if (dist < max_dist) {
+        result.pop();
+        result.push({-dist, i});
+      }
+    }
+  }
 }
 
 void rabitQ::precomputeX0() {

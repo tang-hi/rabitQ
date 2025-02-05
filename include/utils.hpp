@@ -1,6 +1,7 @@
 #pragma once
 #include "Eigen/Dense"
-#include <spdlog/spdlog.h>
+#include "spdlog/spdlog.h"
+#include <fstream>
 
 /**
  * @brief round up a number to the nearest multiple
@@ -35,4 +36,16 @@ inline Eigen::MatrixXf padMatrix(const Eigen::MatrixXf &matrix,
   Eigen::MatrixXf padded(matrix.rows(), expected_cols);
   padded.block(0, 0, matrix.rows(), matrix.cols()) = matrix;
   return padded;
+}
+
+/**
+ * @brief Read an integer from a file
+ *
+ * @param fio the file stream
+ * @return int the integer read
+ */
+inline int readInt32(std::ifstream &fio) {
+  int value;
+  fio.read(reinterpret_cast<char *>(&value), sizeof(value));
+  return value;
 }
