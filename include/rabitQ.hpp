@@ -4,10 +4,16 @@
 #include "utils.hpp"
 #include <cstdint>
 #include <string>
+#include <vector>
 
 class rabitQ {
 public:
   using Matrix = Eigen::MatrixXf;
+  using BinaryMatrix =
+      Eigen::Matrix<uint8_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+  
+  using PackedMatrix =
+      Eigen::Matrix<uint64_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
   rabitQ(std::string data_path, int dimension)
       : data_path_(std::move(data_path)), dimension_(dimension) {
@@ -36,6 +42,18 @@ public:
 private:
   Matrix loadFevcs(const std::string &data_path);
 
+  bool ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
+           std::vector<int> &indices);
+
+  /**
+   * @brief precompute x0, x0 is the inner product of the vector and quantized
+   * vector
+   *
+   */
+  void precomputeX0();
+
+  void packQuantized();
+
 private:
   // data path is the path to the vector, file format should be fvecs
   std::string data_path_;
@@ -50,5 +68,12 @@ private:
 
   Matrix transformed_data_;
 
+  Matrix transformed_centroids_;
+
+  BinaryMatrix binary_data_;
+  Matrix x0_;
+
   uint32_t data_size_;
+
+  PackedMatrix packed_codec_;
 };
