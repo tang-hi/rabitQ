@@ -92,13 +92,21 @@ private:
   // P is a random orthogonal matrix.
   Matrix P_;
 
+  // original data
+  Matrix raw_data_;
+
+  // centroids of the raw data
+  Matrix centroids_;
+
+  // the distance between the data and the centroids
+  std::vector<float> data_dist_to_centroids_;
+
   Matrix transformed_data_;
 
   Matrix transformed_centroids_;
 
-  Matrix data_dist_to_centroids_;
-
   BinaryMatrix binary_data_;
+
   Matrix x0_;
 
   uint32_t data_size_;

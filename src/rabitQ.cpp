@@ -15,9 +15,9 @@ bool rabitQ::train() {
   }
 
   //========= Stage Preprocessing =========
-  auto fevcs = loadFevcs(data_path_);
+  raw_data_ = loadFevcs(data_path_);
 
-  data_size_ = fevcs.rows();
+  data_size_ = raw_data_.rows();
 
   auto PT = P_.transpose();
 
@@ -25,16 +25,15 @@ bool rabitQ::train() {
   // cluster_size is the power of 2
   int cluster_size = roundup(std::min(data_size_ / 256, 1U), 2);
 
-  transformed_data_ = fevcs * P_;
-
-  Matrix centroids = Matrix::Zero(cluster_size, dimension_);
+  centroids_ = Matrix::Zero(cluster_size, dimension_);
   std::vector<int> indices(cluster_size);
-  if (!ivf(cluster_size, transformed_data_, centroids, indices)) {
+  if (!ivf(cluster_size, raw_data_, centroids_, indices)) {
     spdlog::error("Training failed. Stage: IVF");
     return false;
   }
 
-  transformed_centroids_ = centroids * P_;
+  transformed_data_ = raw_data_ * P_;
+  transformed_centroids_ = centroids_ * P_;
 
   // calculate the residuals between transformed_data_ and the centroid each row
   // belongs to
@@ -118,10 +117,9 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
   int max_iter = 100;
   bool converged = false;
 
-  // TODO(tang-hi): add the corresponding data to the inverted list
   while (!converged && max_iter > 0) {
+
     // assign each vector to the nearest centroid
-    std::vector<int> counts(K, 0);
     Matrix new_centroids = Matrix::Zero(K, dimension_);
     for (int i = 0; i < vectors.rows(); ++i) {
       float min_dist = std::numeric_limits<float>::max();
@@ -135,24 +133,26 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
       }
       indices[i] = min_idx;
       new_centroids.row(min_idx) += vectors.row(i);
-      counts[min_idx]++;
+      inverted_index_[min_idx].push_back(i);
     }
 
     // update the centroids
-    for (int i = 0; i < K; ++i) {
-      if (counts[i] == 0) {
+    for (int cluster_id = 0; cluster_id < K; ++cluster_id) {
+      if (inverted_index_[cluster_id].empty()) {
         // if no vector is assigned to the centroid, reinitialize it
         spdlog::warn(
-            "Centroid {} has no vectors assigned to it. Reinitializing", i);
-        centroids.row(i) = Matrix::Random(1, dimension_);
+            "Centroid {} has no vectors assigned to it. Reinitializing",
+            cluster_id);
+        centroids.row(cluster_id) = Matrix::Random(1, dimension_);
       } else {
-        new_centroids.row(i) /= counts[i];
-        if ((new_centroids.row(i) - centroids.row(i)).norm() < 1e-6) {
+        new_centroids.row(cluster_id) /= inverted_index_[cluster_id].size();
+        if ((new_centroids.row(cluster_id) - centroids.row(cluster_id)).norm() <
+            1e-6) {
           converged = true;
         } else {
           converged = false;
         }
-        centroids.row(i) = new_centroids.row(i);
+        centroids.row(cluster_id) = new_centroids.row(cluster_id);
       }
     }
     max_iter--;
@@ -160,6 +160,15 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
 
   spdlog::info("IVF converged: {}, iteration times is {}", converged,
                100 - max_iter);
+
+  // calculate the distance between each vector and the centroid it belongs to
+  data_dist_to_centroids_.clear();
+  for (int i = 0; i < vectors.rows(); ++i) {
+    int centroid_index = indices[i];
+    data_dist_to_centroids_.push_back(
+        (vectors.row(i) - centroids.row(centroid_index)).norm());
+  }
+
   return true;
 }
 
