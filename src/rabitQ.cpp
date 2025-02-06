@@ -182,7 +182,7 @@ auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
 
   // find the nearest centroid
   TopResult nearest_centroids;
-  getNearestCentroids(nprobe, transformed_query, nearest_centroids);
+  getNearestCentroids(nprobe, query_vec, nearest_centroids);
 
   while (!nearest_centroids.empty()) {
     auto [negative_dist, centroid_idx] = nearest_centroids.top();
@@ -193,6 +193,7 @@ auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
     auto quantized_query = quantizeQuery(transformed_query, centroid_idx,
                                          residual_min, width, sum);
   }
+  return {};
 }
 
 auto rabitQ::quantizeQuery(const Matrix &query, int centroid_idx,
@@ -259,10 +260,10 @@ void rabitQ::scanCluster(const Matrix &query, float cluster_dist,
   }
 }
 
-void rabitQ::getNearestCentroids(int nprobe, const Matrix &transformed_query,
+void rabitQ::getNearestCentroids(int nprobe, const Matrix &query,
                                  TopResult &result) {
-  for (int i = 0; i < transformed_centroids_.rows(); ++i) {
-    float dist = (transformed_query - transformed_centroids_.row(i)).norm();
+  for (int i = 0; i < centroids_.rows(); ++i) {
+    float dist = (query - centroids_.row(i)).norm();
     if (result.size() < nprobe) {
       result.push({-dist, i});
     } else {
