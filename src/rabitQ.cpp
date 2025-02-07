@@ -2,11 +2,15 @@
 #include "Eigen/Dense"
 #include "utils.hpp"
 #include <algorithm>
+#include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <queue>
 #include <spdlog/spdlog.h>
+#include <utility>
+#include <vector>
 
 bool rabitQ::train() {
   if (!std::filesystem::exists(data_path_)) {
@@ -32,11 +36,19 @@ bool rabitQ::train() {
     return false;
   }
 
-  transformed_data_ = raw_data_ * P_;
-  transformed_centroids_ = centroids_ * P_;
+  // create the inverted index
+  inverted_index_.clear();
+  for (int i = 0; i < data_size_; ++i) {
+    inverted_index_[indices[i]].push_back(i);
+  }
+
+  transformed_data_ = raw_data_ * PT;
+  transformed_centroids_ = centroids_ * PT;
 
   // calculate the residuals between transformed_data_ and the centroid each row
   // belongs to
+  // P.T * (O_r - C) / ||O_r - C||, where O_r is the original row, C is the
+  // centroid since ||O_r - C|| will not affect the sign, we can ignore it
   for (int i = 0; i < transformed_data_.rows(); ++i) {
     int centroid_index = indices[i]; // using existing membership in indices
     transformed_data_.row(i) =
@@ -45,15 +57,28 @@ bool rabitQ::train() {
 
   // convert the transformed data to binary, eg. if the value is greater than 0
   // the bit is 1 otherwise 0
+  // binary_data_ could represent the quantized data
+  // eg. P((2 * binary_data - 1) * sqrt(D)) is the quantized data
   binary_data_ = (transformed_data_.array() > 0).cast<uint8_t>();
 
+  // precompute x0 eg. </bar o, o> in the paper
   precomputeX0();
 
+  // pack the binary data to uint64_t format
   packQuantized();
 
-  //========= Stage Indexing =========
+  // do the popcount for the packed data
+  precomputePopcount();
 
   return true;
+}
+
+void rabitQ::precomputePopcount() {
+  for (int i = 0; i < data_size_; ++i) {
+    for (int j = 0; j < packed_codec_.cols(); ++j) {
+      popcount_[i] += __builtin_popcountll(packed_codec_(i, j));
+    }
+  }
 }
 
 // TODO: Implement this function
@@ -97,9 +122,11 @@ rabitQ::Matrix rabitQ::loadFevcs(const std::string &data_path) {
   return data;
 }
 
-// TODO: Implement this function
 /**
  * @brief Perform the IVF quantization
+ * 1. generate K centroids
+ * 2. store the indices of the vectors that belong to each centroid
+ * 3. store the vector distances to the centroid it belongs to
  *
  * @param K Number of centroids
  * @param vectors The vectors to quantize
@@ -118,7 +145,7 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
   bool converged = false;
 
   while (!converged && max_iter > 0) {
-
+    std::vector<int> cluster_counts(K, 0);
     // assign each vector to the nearest centroid
     Matrix new_centroids = Matrix::Zero(K, dimension_);
     for (int i = 0; i < vectors.rows(); ++i) {
@@ -132,26 +159,27 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
         }
       }
       indices[i] = min_idx;
+      cluster_counts[min_idx]++;
       new_centroids.row(min_idx) += vectors.row(i);
-      inverted_index_[min_idx].push_back(i);
     }
 
     // update the centroids
     for (int cluster_id = 0; cluster_id < K; ++cluster_id) {
-      if (inverted_index_[cluster_id].empty()) {
+      if (cluster_counts[cluster_id] == 0) {
         // if no vector is assigned to the centroid, reinitialize it
         spdlog::warn(
             "Centroid {} has no vectors assigned to it. Reinitializing",
             cluster_id);
         centroids.row(cluster_id) = Matrix::Random(1, dimension_);
       } else {
-        new_centroids.row(cluster_id) /= inverted_index_[cluster_id].size();
+        new_centroids.row(cluster_id) /= cluster_counts[cluster_id];
         if ((new_centroids.row(cluster_id) - centroids.row(cluster_id)).norm() <
             1e-6) {
           converged = true;
         } else {
           converged = false;
         }
+        // update the centroid
         centroids.row(cluster_id) = new_centroids.row(cluster_id);
       }
     }
@@ -168,7 +196,6 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
     data_dist_to_centroids_.push_back(
         (vectors.row(i) - centroids.row(centroid_index)).norm());
   }
-
   return true;
 }
 
@@ -178,86 +205,155 @@ auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
 
   // convert the query to the transformed domain
   Eigen::Map<Matrix> query_vec(query, 1, dimension_);
-  auto transformed_query = query_vec * PT;
+  // auto transformed_query = query_vec * PT;
 
   // find the nearest centroid
   TopResult nearest_centroids;
   getNearestCentroids(nprobe, query_vec, nearest_centroids);
 
   while (!nearest_centroids.empty()) {
-    auto [negative_dist, centroid_idx] = nearest_centroids.top();
+    auto residual_query =
+        query_vec - centroids_.row(nearest_centroids.top().second);
+
+    // transformed_query is q^{,} int the paper
+    auto transformed_query = residual_query * PT;
+    auto [dist, centroid_idx] = nearest_centroids.top();
     nearest_centroids.pop();
-    int residual_min;
+    int query_min;
     float width;
     int sum;
-    auto quantized_query = quantizeQuery(transformed_query, centroid_idx,
-                                         residual_min, width, sum);
+    auto quantized_query =
+        quantizeQuery(transformed_query, centroid_idx, query_min, width, sum);
+
+    ScanContext context;
+    context.centroid_idx = centroid_idx;
+    context.cluster_dist = dist;
+    context.query_min = query_min;
+    context.width = width;
+    context.sum = sum;
+    context.coeff_1 = -2 * query_min / norm_factor_;
+    context.coeff_2 = -2 * width / norm_factor_;
+    context.error_bound_coeff =
+        2 * (1.9 / std::sqrt(static_cast<float>(dimension_ - 1)));
+
+    // TODO(tang-hi): maybe we should avoid the copy here
+    context.raw_query = query_vec;
+    context.quantized_query = quantized_query;
+
+    scanCluster(context, result);
   }
-  return {};
+  return result;
 }
 
 auto rabitQ::quantizeQuery(const Matrix &query, int centroid_idx,
-                           int &residual_min, float &width, int &sum)
-    -> Matrix {
-  auto centroid = transformed_centroids_.row(centroid_idx);
-  auto residual_query = query.row(0) - centroid;
-  auto residual_query_min = residual_query.minCoeff();
-  auto residual_query_max = residual_query.maxCoeff();
-  width = (residual_query_max - residual_query_min) / ((1 << Bq_) - 1);
-  residual_min = residual_query_min;
+                           int &query_min, float &width, int &sum) -> BinaryMatrix{
+  query_min = query.minCoeff();
+  sum = 0;
+  auto query_max = query.maxCoeff();
+  width = (query_max - query_min) / ((1 << Bq_) - 1);
   BinaryMatrix quantized_query(1, dimension_);
-  for (int i = 0; i < dimension_; ++i) {
-    quantized_query(0, i) = static_cast<uint8_t>(
-        (residual_query(0, i) - residual_query_min) / width);
 
+  for (int i = 0; i < dimension_; ++i) {
+    auto quantized_val = (query(0, i) - query_min) / width;
+    quantized_val += u_(0, i);
+    quantized_query(0, i) = static_cast<uint8_t>(quantized_val);
+    // accumulate the quantized value, reuse the sum variable during the query
     sum += quantized_query(0, i);
   }
   return quantized_query;
 }
 
-void rabitQ::scanCluster(const Matrix &query, float cluster_dist,
-                         int cluster_id, TopResult &result) {
-  constexpr int size = 32;
-  auto cluster_size = inverted_index_[cluster_id].size();
-  uint32_t i = 0;
-  for (; i < cluster_size; i += size) {
-    for (int j = 0; j < size; ++j) {
-      float tmp_dist =
-          data_dist_to_centroids_[inverted_index_[cluster_id][i + j]] +
-          cluster_dist + /* ptr_fac->factor_ppc */ residual_min +
-          /* (distance between quant_query and packed_codec * 2 - sumq ) */ 0 *
-              /* (ptr_fac->factor_ip)*/ width;
+void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
+  auto cluster_size = inverted_index_[context.centroid_idx].size();
+  constexpr uint32_t rerank_batch = 32;
+  std::vector<std::pair<float, int>> rerank_queue;
 
-      float error_bound = cluster_dist * 1 /* ptr_fac->error*/;
+  // TODO(tang-hi): need to optimize the inner product calculation
+  auto calculate_inner_product =
+      [](const BinaryMatrix &quantized_query,
+         const PackedMatrix &quantized_data) -> uint64_t {
+    uint64_t inner_product = 0;
+    for (int i = 0; i < quantized_data.cols(); ++i) {
+      for (int j = 0; j < 64; j++) {
+        inner_product += ((quantized_data(0, i)) & (1 << (63 - j)) ? 1 : 0) *
+                         ((quantized_query(0, i * 64 + j)));
+      }
+    }
+    return inner_product;
+  };
+
+  for (int i = 0; i < cluster_size; i++) {
+    int data_idx = inverted_index_[context.centroid_idx][i];
+    float raw_to_centroid = data_dist_to_centroids_[data_idx];
+    float raw_query_to_centroid = context.cluster_dist;
+    float x0_val = x0_[data_idx];
+
+    float distance_1 = context.coeff_1 * raw_query_to_centroid / x0_val *
+                       (2 * popcount_[data_idx] - dimension_);
+
+    float distance_2 =
+        context.coeff_2 * raw_to_centroid / x0_val *
+        (2 * calculate_inner_product(context.quantized_query,
+                                     packed_codec_.row(data_idx)) -
+         context.sum);
+
+    float distance = raw_to_centroid * raw_to_centroid +
+                     raw_query_to_centroid * raw_query_to_centroid +
+                     distance_1 + distance_2;
+
+    float error_bound = context.error_bound_coeff * raw_to_centroid *
+                        raw_query_to_centroid *
+                        std::sqrt((1 - x0_val * x0_val) / (x0_val * x0_val));
+
+    rerank_queue.push_back({distance - error_bound, data_idx});
+
+    if (rerank_queue.size() == rerank_batch) {
+      // may be we could sort the rerank_queue, so we could reduce the disk
+      // times
+      for (auto &[dist, idx] : rerank_queue) {
+        if (result.size() < context.K) {
+          // TODO(tang-hi): precompute the real distance in the disk, currently
+          // is in memory
+          auto real_dist = (context.raw_query - raw_data_.row(idx)).norm();
+          result.push({real_dist, idx});
+        } else {
+          auto max_dist = result.top().first;
+          if (dist < max_dist) {
+            // TODO(tang-hi): precompute the real distance in the disk,
+            // currently is in memory
+            auto ground_truth = (context.raw_query - raw_data_.row(idx)).norm();
+            if (ground_truth < max_dist) {
+              result.pop();
+              result.push({ground_truth, idx});
+            }
+          }
+        }
+      }
+      rerank_queue.clear();
     }
   }
 
-  for (; i < cluster_size; ++i) {
-    float tmp_dist =
-        data_dist_to_centroids_[inverted_index_[cluster_id][i]] + cluster_dist +
-        /* ptr_fac->factor_ppc */ residual_min +
-        /* (distance between quant_query and packed_codec * 2 - sumq ) */ 0 *
-            /* (ptr_fac->factor_ip)*/ width;
-
-    float error_bound = cluster_dist * 1 /* ptr_fac->error*/;
-    if (result.size() < K) {
-      auto ground_truth =
-          query[0] *
-          transformed_data_.row(inverted_index_[cluster_id][i]).transpose();
-      result.push({-ground_truth(0, 0), inverted_index_[cluster_id][i]});
+  // process the remaining elements in the rerank_queue
+  for (auto &[dist, idx] : rerank_queue) {
+    if (result.size() < context.K) {
+      // TODO(tang-hi): precompute the real distance in the disk, currently
+      // is in memory
+      auto real_dist = (context.raw_query - raw_data_.row(idx)).norm();
+      result.push({real_dist, idx});
     } else {
-      auto max_dist = -1 * result.top().second;
-      if ((tmp_dist - error_bound) < max_dist) {
-        auto ground_truth =
-            query[0] *
-            transformed_data_.row(inverted_index_[cluster_id][i]).transpose();
-        if (ground_truth(0, 0) < max_dist) {
+      auto max_dist = result.top().first;
+      if (dist < max_dist) {
+        // TODO(tang-hi): precompute the real distance in the disk, currently
+        // is in memory
+        auto ground_truth = (context.raw_query - raw_data_.row(idx)).norm();
+        if (ground_truth < max_dist) {
           result.pop();
-          result.push({-ground_truth(0, 0), inverted_index_[cluster_id][i]});
+          result.push({ground_truth, idx});
         }
       }
     }
   }
+  return;
 }
 
 void rabitQ::getNearestCentroids(int nprobe, const Matrix &query,
@@ -265,57 +361,59 @@ void rabitQ::getNearestCentroids(int nprobe, const Matrix &query,
   for (int i = 0; i < centroids_.rows(); ++i) {
     float dist = (query - centroids_.row(i)).norm();
     if (result.size() < nprobe) {
-      result.push({-dist, i});
+      result.push({dist, i});
     } else {
-      auto max_dist = -1 * result.top().second;
+      auto max_dist = result.top().first;
       if (dist < max_dist) {
         result.pop();
-        result.push({-dist, i});
+        result.push({dist, i});
       }
     }
   }
 }
 
 void rabitQ::precomputeX0() {
-  // precompute x0
   // x0 is the inner product of the vector and quantized vector
-  float norm_factor = std::sqrt(static_cast<float>(dimension_));
-  x0_.resize(data_size_, 1);
+  // when the dimension is high, the norm of the vector is 0, but in high
+  // dimension the inner product of the vector and the quantized vector is
+  // very close to 0.8
+  std::vector<float> x0(data_size_, 0.8);
   for (int i = 0; i < data_size_; ++i) {
-    float row_sum = ((transformed_data_.row(i).array() *
-                      ((binary_data_.row(i).cast<float>().array() * 2) - 1)) /
-                     norm_factor)
-                        .sum();
-    float row_norm = transformed_data_.row(i).norm();
-    if (row_norm == 0) {
-      // when the dimension is high, the norm of the vector is 0, but in high
-      // dimension the inner product of the vector and the quantized vector is
-      // very close to 0.8
-      x0_(i, 0) = 0.8;
+
+    // (2 * binary_data - 1) * sqrt(D) dot P
+    auto converted_data =
+        (binary_data_.row(i).cast<float>().array() * 2 - 1) * norm_factor_;
+    auto quantized_data = converted_data.matrix() * P_;
+
+    auto residual = raw_data_.row(i) - centroids_.row(i);
+    auto residual_norm = residual.norm();
+    if (residual_norm == 0) {
+      continue;
     } else {
-      x0_(i, 0) = row_sum / row_norm;
+      // calculate the inner product of the vector and the quantized vector
+      x0[i] = (quantized_data * residual.transpose())(0, 0) / residual_norm;
     }
   }
 }
 
 void rabitQ::packQuantized() {
   // convert binary data to uint64_t codec format
-
+  // already padded to the nearest multiple of 64, it is safe to assume that
+  assert(dimension_ % 64 == 0);
   int num_blocks = dimension_ >> 6; // number of uint64_t per row
 
   // Create a matrix to hold uint64_t packed data with shape (data_size_,
   // dimension_/64)
   packed_codec_(data_size_, num_blocks);
+
   for (int i = 0; i < data_size_; ++i) {
     for (int block = 0; block < num_blocks; ++block) {
       uint64_t word = 0;
-      // Process 8 rows (each of 8 bits) in the block; note: reversing the
-      // order of rows
-      for (int j = 0; j < 8; ++j) {
+      // Process 8 columns (each of 8 bits) in the block;
+      for (int byte = 0; byte < 8; ++byte) {
         uint8_t byte_val = 0;
-        int row_idx = 7 - j; // reverse row order within the block
-        for (int k = 0; k < 8; ++k) {
-          int col_idx = block * 64 + row_idx * 8 + k;
+        for (int idx = 0; idx < 8; ++idx) {
+          int col_idx = block * 64 + byte * 8 + idx;
           byte_val = (byte_val << 1) | (binary_data_(i, col_idx) & 1);
         }
         word = (word << 8) | byte_val;

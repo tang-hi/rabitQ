@@ -24,8 +24,16 @@ public:
     int K;
     int centroid_idx;
     float cluster_dist;
-    float residual_min;
+    float query_min;
     float width;
+    float coeff_1;
+
+    float coeff_2; 
+
+    float error_bound_coeff;
+
+    Matrix raw_query;
+    BinaryMatrix quantized_query;
     int sum;
   };
 
@@ -39,6 +47,7 @@ public:
           dimension_, roundup(dimension_, 64));
       dimension_ = roundup(dimension_, 64);
     }
+    norm_factor_ = std::sqrt(static_cast<float>(dimension_));
 
     P_ = Matrix::Random(dimension_, dimension_);
     Eigen::HouseholderQR<Matrix> qr(P_);
@@ -64,21 +73,24 @@ private:
            std::vector<int> &indices);
 
   /**
-   * @brief precompute x0, x0 is the inner product of the vector and quantized
-   * vector
+   * @brief precompute x0, x0 is the inner product of the quantized vector and
+   * normalized vector
    *
    */
   void precomputeX0();
 
   void packQuantized();
 
-  void getNearestCentroids(int nprobe, const Matrix &transformed_query,
+  void getNearestCentroids(int nprobe, const Matrix &raw_query,
                            TopResult &result);
 
-  Matrix quantizeQuery(const Matrix &query, int centroid_idx, int &residual_min,
+  BinaryMatrix quantizeQuery(const Matrix &query, int centroid_idx, int &query_min,
                        float &width, int &sum);
 
-  void scanCluster(const Matrix &query, float cluster_dist, TopResult &result);
+  void scanCluster(ScanContext &context, TopResult &result);
+
+  void precomputePopcount();
+
 
 private:
   // data path is the path to the vector, file format should be fvecs
@@ -107,11 +119,18 @@ private:
 
   BinaryMatrix binary_data_;
 
-  Matrix x0_;
+  // Matrix x0_;
 
   uint32_t data_size_;
 
   PackedMatrix packed_codec_;
+
+  // norm_factor is the square root of the dimension
+  float norm_factor_;
+
+  std::vector<float> x0_;
+
+  std::vector<int> popcount_;
 
   // u_ is the sampled from the uniform distribution on [0, 1]
   Matrix u_;
