@@ -27,10 +27,10 @@ bool rabitQ::train() {
 
   // 256 is the default vector number in the cluster
   // cluster_size is the power of 2
-  int cluster_size = roundup(std::min(data_size_ / 256, 1U), 2);
+  int cluster_size = roundup(std::max(data_size_ / 5000, 1U), 2);
 
   centroids_ = Matrix::Zero(cluster_size, dimension_);
-  std::vector<int> indices(cluster_size);
+  std::vector<int> indices(data_size_);
   if (!ivf(cluster_size, raw_data_, centroids_, indices)) {
     spdlog::error("Training failed. Stage: IVF");
     return false;
@@ -74,6 +74,7 @@ bool rabitQ::train() {
 }
 
 void rabitQ::precomputePopcount() {
+  popcount_.resize(data_size_);
   for (int i = 0; i < data_size_; ++i) {
     for (int j = 0; j < packed_codec_.cols(); ++j) {
       popcount_[i] += __builtin_popcountll(packed_codec_(i, j));
@@ -97,7 +98,7 @@ bool rabitQ::load(const std::string &index_path) { return false; }
 rabitQ::Matrix rabitQ::loadFevcs(const std::string &data_path) {
   std::filesystem::path path(data_path);
   if (!std::filesystem::exists(path)) {
-    spdlog::error("Data path does not exist.");
+    spdlog::error("Data path {} does not exist.", data_path);
     return Matrix();
   }
 
@@ -152,7 +153,7 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
       float min_dist = std::numeric_limits<float>::max();
       int min_idx = -1;
       for (int j = 0; j < K; ++j) {
-        float dist = (vectors.row(i) - centroids.row(j)).squaredNorm();
+        float dist = (vectors.row(i) - centroids.row(j)).norm();
         if (dist < min_dist) {
           min_dist = dist;
           min_idx = j;
@@ -246,7 +247,8 @@ auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
 }
 
 auto rabitQ::quantizeQuery(const Matrix &query, int centroid_idx,
-                           int &query_min, float &width, int &sum) -> BinaryMatrix{
+                           int &query_min, float &width, int &sum)
+    -> BinaryMatrix {
   query_min = query.minCoeff();
   sum = 0;
   auto query_max = query.maxCoeff();
@@ -373,11 +375,8 @@ void rabitQ::getNearestCentroids(int nprobe, const Matrix &query,
 }
 
 void rabitQ::precomputeX0() {
-  // x0 is the inner product of the vector and quantized vector
-  // when the dimension is high, the norm of the vector is 0, but in high
-  // dimension the inner product of the vector and the quantized vector is
-  // very close to 0.8
-  std::vector<float> x0(data_size_, 0.8);
+
+  x0_.resize(data_size_);
   for (int i = 0; i < data_size_; ++i) {
 
     // (2 * binary_data - 1) * sqrt(D) dot P
@@ -388,10 +387,15 @@ void rabitQ::precomputeX0() {
     auto residual = raw_data_.row(i) - centroids_.row(i);
     auto residual_norm = residual.norm();
     if (residual_norm == 0) {
+      // x0 is the inner product of the vector and quantized vector
+      // when the dimension is high, the norm of the vector is 0, but in high
+      // dimension the inner product of the vector and the quantized vector is
+      // very close to 0.8
+      x0_[i] = 0.8;
       continue;
     } else {
       // calculate the inner product of the vector and the quantized vector
-      x0[i] = (quantized_data * residual.transpose())(0, 0) / residual_norm;
+      x0_[i] = (quantized_data * residual.transpose())(0, 0) / residual_norm;
     }
   }
 }
@@ -404,7 +408,7 @@ void rabitQ::packQuantized() {
 
   // Create a matrix to hold uint64_t packed data with shape (data_size_,
   // dimension_/64)
-  packed_codec_(data_size_, num_blocks);
+  packed_codec_ = PackedMatrix::Zero(data_size_, num_blocks);
 
   for (int i = 0; i < data_size_; ++i) {
     for (int block = 0; block < num_blocks; ++block) {

@@ -11,5 +11,6 @@ find_package(spdlog REQUIRED)
 
 include_directories(${CMAKE_SOURCE_DIR}/include)
 add_executable(rabitQ src/main.cpp src/rabitQ.cpp)
+target_compile_options(rabitQ PRIVATE -O2 -g)
 
 target_link_libraries(rabitQ Eigen3::Eigen spdlog::spdlog)
