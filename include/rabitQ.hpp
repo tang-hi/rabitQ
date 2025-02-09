@@ -28,7 +28,7 @@ public:
     float width;
     float coeff_1;
 
-    float coeff_2; 
+    float coeff_2;
 
     float error_bound_coeff;
 
@@ -62,13 +62,17 @@ public:
 
   bool load(const std::string &index_path);
 
+  int skipped() const { return skip_; }
+
+  int wrong_estimate() const { return wrong_estimate_; }
+
+  int estimated() const { return estimated_; }
+
   TopResult search(int K, int nprobe, float *query);
 
   ~rabitQ() = default;
 
 private:
-  Matrix loadFevcs(const std::string &data_path);
-
   bool ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
            std::vector<int> &indices);
 
@@ -84,13 +88,12 @@ private:
   void getNearestCentroids(int nprobe, const Matrix &raw_query,
                            TopResult &result);
 
-  BinaryMatrix quantizeQuery(const Matrix &query, int centroid_idx, int &query_min,
-                       float &width, int &sum);
+  BinaryMatrix quantizeQuery(const Matrix &query, int centroid_idx,
+                             float &query_min, float &width, int &sum);
 
   void scanCluster(ScanContext &context, TopResult &result);
 
   void precomputePopcount();
-
 
 private:
   // data path is the path to the vector, file format should be fvecs
@@ -140,4 +143,12 @@ private:
   int Bq_ = 4;
 
   std::unordered_map<int, std::vector<int>> inverted_index_;
+
+  int skip_{0};
+
+  int wrong_estimate_{0};
+
+  int estimated_{0};
+
+  std::vector<int> indices_;
 };

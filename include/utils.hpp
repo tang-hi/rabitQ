@@ -1,6 +1,7 @@
 #pragma once
 #include "Eigen/Dense"
 #include "spdlog/spdlog.h"
+#include <filesystem>
 #include <fstream>
 
 /**
@@ -48,4 +49,47 @@ inline int readInt32(std::ifstream &fio) {
   int value;
   fio.read(reinterpret_cast<char *>(&value), sizeof(value));
   return value;
+}
+
+/**
+ * @brief Load the float vectors from the data path
+ *
+ * @param data_path
+ * @return rabitQ::Matrix (N, D) matrix where N is the number of vectors and D
+ * is the dimension of the vectors
+ */
+inline Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+loadFvecs(const std::string &data_path) {
+  std::filesystem::path path(data_path);
+  if (!std::filesystem::exists(path)) {
+    spdlog::error("Data path {} does not exist.", data_path);
+    return {};
+  }
+
+  // Load the data from the file
+  // The data is stored in the fvecs format
+  // The first 4 bytes are the dimension of the vector, remaining bytes are the
+  // float values
+  auto fio = std::ifstream(data_path, std::ios::binary);
+
+  auto file_size = std::filesystem::file_size(path);
+  // The first 4 bytes are the dimension of the vector
+  auto dim = readInt32(fio);
+
+  if (file_size % (dim * sizeof(float) + sizeof(int)) != 0) {
+    spdlog::error("The file size is not a multiple of the vector size");
+    return {};
+  }
+  auto num_vectors = file_size / (dim * sizeof(float) + sizeof(int));
+
+  Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> data(
+      num_vectors, dim);
+
+  fio.seekg(0);
+  for (int i = 0; i < num_vectors; ++i) {
+    // skip the dimension
+    fio.seekg(sizeof(int), std::ios::cur);
+    fio.read(reinterpret_cast<char *>(data.row(i).data()), dim * sizeof(float));
+  }
+  return data;
 }
