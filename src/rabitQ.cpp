@@ -101,6 +101,65 @@ bool rabitQ::load(const std::string &index_path) { return false; }
  */
 bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
                  std::vector<int> &indices) {
+  /*
+  int n = X.rows();
+  int d = X.cols();
+
+  // Random initialization of centroids
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<> dist(0, n-1);
+  MatrixXd centroids(C, d);
+  for (int c = 0; c < C; ++c) {
+    centroids.row(c) = X.row(dist(gen));
+  }
+
+  MatrixXd new_centroids;
+  VectorXi assignments(n);
+
+  for (int iter = 0; iter < max_iter; ++iter) {
+    // Compute terms for distance calculation: -2 * X * centroids^T + ||centroids||^2
+    MatrixXd XC = X * centroids.transpose();
+    VectorXd C_sq = centroids.rowwise().squaredNorm();
+    MatrixXd dist_terms = (-2 * XC).rowwise() + C_sq.transpose();
+
+    // Assign each point to the nearest centroid
+    for (int i = 0; i < n; ++i) {
+      dist_terms.row(i).minCoeff(&assignments[i]);
+    }
+
+    // Update centroids using sparse matrix for efficient summation
+    typedef SparseMatrix<double> SpMat;
+    SpMat A(C, n);
+    std::vector<Triplet<double>> triplets;
+    triplets.reserve(n);
+    for (int i = 0; i < n; ++i) {
+      triplets.emplace_back(assignments[i], i, 1.0);
+    }
+    A.setFromTriplets(triplets.begin(), triplets.end());
+
+    new_centroids = MatrixXd::Zero(C, d);
+    VectorXd counts = VectorXd::Zero(C);
+    new_centroids = A * X;
+    counts = A * VectorXd::Ones(n);
+
+    // Normalize centroids and handle empty clusters
+    for (int c = 0; c < C; ++c) {
+      if (counts(c) > 0) {
+        new_centroids.row(c) /= counts(c);
+      } else {
+        // Re-initialize empty cluster to a random data point
+        new_centroids.row(c) = X.row(dist(gen));
+      }
+    }
+
+    // Check for convergence
+    if ((new_centroids - centroids).cwiseAbs().maxCoeff() < tol) {
+      break;
+    }
+    centroids = new_centroids;
+  }
+  */
 
   // random initialization of centroids
   centroids = Matrix::Random(K, dimension_);
