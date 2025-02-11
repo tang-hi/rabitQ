@@ -1,6 +1,8 @@
 #include "rabitQ.hpp"
 #include "Eigen/Dense"
 #include "utils.hpp"
+#include <Eigen/src/Core/Matrix.h>
+#include <Eigen/src/Core/util/Meta.h>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -19,6 +21,8 @@ bool rabitQ::train() {
 
   //========= Stage Preprocessing =========
   raw_data_ = loadFvecs(data_path_);
+  spdlog::info("Data loaded. Rows: {}, Cols: {}", raw_data_.rows(),
+               raw_data_.cols());
 
   data_size_ = raw_data_.rows();
 
@@ -87,6 +91,15 @@ bool rabitQ::save(const std::string &saved_path) { return false; }
 // TODO: Implement this function
 bool rabitQ::load(const std::string &index_path) { return false; }
 
+auto rabitQ::computeDistanceMatrix(const Matrix &vectors, const Matrix &centroids) -> Matrix {
+  Eigen::VectorXf vec_sq = vectors.rowwise().squaredNorm();
+  Eigen::VectorXf centroid_sq = centroids.rowwise().squaredNorm();
+  Matrix dists = -2 * vectors * centroids.transpose();
+  dists = dists.colwise() + vec_sq;
+  dists = dists.rowwise() + centroid_sq.transpose();
+  return dists;
+}
+
 /**
  * @brief Perform the IVF quantization
  * 1. generate K centroids
@@ -101,112 +114,45 @@ bool rabitQ::load(const std::string &index_path) { return false; }
  */
 bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
                  std::vector<int> &indices) {
-  /*
-  int n = X.rows();
-  int d = X.cols();
-
-  // Random initialization of centroids
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_int_distribution<> dist(0, n-1);
-  MatrixXd centroids(C, d);
-  for (int c = 0; c < C; ++c) {
-    centroids.row(c) = X.row(dist(gen));
-  }
-
-  MatrixXd new_centroids;
-  VectorXi assignments(n);
-
-  for (int iter = 0; iter < max_iter; ++iter) {
-    // Compute terms for distance calculation: -2 * X * centroids^T + ||centroids||^2
-    MatrixXd XC = X * centroids.transpose();
-    VectorXd C_sq = centroids.rowwise().squaredNorm();
-    MatrixXd dist_terms = (-2 * XC).rowwise() + C_sq.transpose();
-
-    // Assign each point to the nearest centroid
-    for (int i = 0; i < n; ++i) {
-      dist_terms.row(i).minCoeff(&assignments[i]);
-    }
-
-    // Update centroids using sparse matrix for efficient summation
-    typedef SparseMatrix<double> SpMat;
-    SpMat A(C, n);
-    std::vector<Triplet<double>> triplets;
-    triplets.reserve(n);
-    for (int i = 0; i < n; ++i) {
-      triplets.emplace_back(assignments[i], i, 1.0);
-    }
-    A.setFromTriplets(triplets.begin(), triplets.end());
-
-    new_centroids = MatrixXd::Zero(C, d);
-    VectorXd counts = VectorXd::Zero(C);
-    new_centroids = A * X;
-    counts = A * VectorXd::Ones(n);
-
-    // Normalize centroids and handle empty clusters
-    for (int c = 0; c < C; ++c) {
-      if (counts(c) > 0) {
-        new_centroids.row(c) /= counts(c);
-      } else {
-        // Re-initialize empty cluster to a random data point
-        new_centroids.row(c) = X.row(dist(gen));
-      }
-    }
-
-    // Check for convergence
-    if ((new_centroids - centroids).cwiseAbs().maxCoeff() < tol) {
-      break;
-    }
-    centroids = new_centroids;
-  }
-  */
-
   // random initialization of centroids
   centroids = Matrix::Random(K, dimension_);
 
   // perform k-means clustering
   int max_iter = 100;
   bool converged = false;
+  float threshold = 1e-5;
 
+  Matrix new_centroids = Matrix::Zero(K, dimension_);
   while (!converged && max_iter > 0) {
-    std::vector<int> cluster_counts(K, 0);
+    std::vector<int> cluster_count(K, 0);
+    spdlog::info("Start IVF iteration: {}", 100 - max_iter);
     // assign each vector to the nearest centroid
-    Matrix new_centroids = Matrix::Zero(K, dimension_);
+    Matrix dists = computeDistanceMatrix(vectors, centroids);
+    spdlog::info("Distance matrix computed");
+
     for (int i = 0; i < vectors.rows(); ++i) {
-      float min_dist = std::numeric_limits<float>::max();
-      int min_idx = -1;
-      for (int j = 0; j < K; ++j) {
-        float dist = (vectors.row(i) - centroids.row(j)).norm();
-        if (dist < min_dist) {
-          min_dist = dist;
-          min_idx = j;
-        }
+      Eigen::Index min_index;
+      dists.row(i).minCoeff(&min_index);
+      cluster_count[min_index]++;
+      indices[i] = min_index;
+      new_centroids.row(min_index) += vectors.row(i);
+      if (i % 10000 == 0) {
+        spdlog::info("IVF iteration: {}/{}", i, vectors.rows());
       }
-      indices[i] = min_idx;
-      cluster_counts[min_idx]++;
-      new_centroids.row(min_idx) += vectors.row(i);
+    }
+    spdlog::info("Belongs to computed");
+    for (int i = 0; i < K; ++i) {
+      if (cluster_count[i] == 0) {
+        spdlog::warn("Cluster {} is empty", i);
+        // reinitialize the centroid
+        centroids.row(i) = Matrix::Random(1, dimension_);
+      } else {
+        new_centroids.row(i) /= cluster_count[i];
+      }
     }
 
-    // update the centroids
-    for (int cluster_id = 0; cluster_id < K; ++cluster_id) {
-      if (cluster_counts[cluster_id] == 0) {
-        // if no vector is assigned to the centroid, reinitialize it
-        spdlog::warn(
-            "Centroid {} has no vectors assigned to it. Reinitializing",
-            cluster_id);
-        centroids.row(cluster_id) = Matrix::Random(1, dimension_);
-      } else {
-        new_centroids.row(cluster_id) /= cluster_counts[cluster_id];
-        if ((new_centroids.row(cluster_id) - centroids.row(cluster_id)).norm() <
-            1e-6) {
-          converged = true;
-        } else {
-          converged = false;
-        }
-        // update the centroid
-        centroids.row(cluster_id) = new_centroids.row(cluster_id);
-      }
-    }
+    converged = (centroids - new_centroids).norm() < threshold;
+
     max_iter--;
   }
 

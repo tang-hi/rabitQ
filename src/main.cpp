@@ -34,13 +34,12 @@ std::vector<std::vector<int>> loadGroundTruth(const std::string &data_path) {
 }
 
 int main(int argc, char *argv[]) {
-  std::cout << "Hello, World!" << std::endl;
   constexpr std::string_view data_path =
-      "/home/hayes/projects/rabitQ/data/siftsmall/siftsmall_base.fvecs";
+      "";
   constexpr std::string_view query_path =
-      "/home/hayes/projects/rabitQ/data/siftsmall/siftsmall_query.fvecs";
+      "";
   constexpr std::string_view ground_truth_path =
-      "/home/hayes/projects/rabitQ/data/siftsmall/siftsmall_groundtruth.ivecs";
+      "";
   constexpr int dimension = 128;
   rabitQ rabit(data_path.data(), dimension);
 

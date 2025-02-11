@@ -62,6 +62,9 @@ public:
 
   bool load(const std::string &index_path);
 
+  Matrix computeDistanceMatrix(const Matrix &vectors,
+                              const Matrix &centroids);
+
   int skipped() const { return skip_; }
 
   int wrong_estimate() const { return wrong_estimate_; }
