@@ -28,9 +28,9 @@ bool rabitQ::train() {
 
   auto PT = P_.transpose();
 
-  // 256 is the default vector number in the cluster
+  // 25600 is the default vector number in the cluster
   // cluster_size is the power of 2
-  int cluster_size = roundup(std::max(data_size_ / 256, 1U), 2);
+  int cluster_size = roundup(std::max(data_size_ / 25600, 1U), 2);
 
   centroids_ = Matrix::Zero(cluster_size, dimension_);
   indices_.resize(data_size_);
@@ -123,36 +123,46 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
   float threshold = 1e-5;
 
   Matrix new_centroids = Matrix::Zero(K, dimension_);
+  Matrix dists;
+  std::vector<uint32_t> assignment_error(K, 0);
   while (!converged && max_iter > 0) {
     std::vector<int> cluster_count(K, 0);
     spdlog::info("Start IVF iteration: {}", 100 - max_iter);
     // assign each vector to the nearest centroid
     Matrix dists = computeDistanceMatrix(vectors, centroids);
-    spdlog::info("Distance matrix computed");
+
+    new_centroids.setZero();
+    Matrix M = Matrix::Zero(vectors.rows(), K);
 
     for (int i = 0; i < vectors.rows(); ++i) {
       Eigen::Index min_index;
       dists.row(i).minCoeff(&min_index);
-      cluster_count[min_index]++;
       indices[i] = min_index;
-      new_centroids.row(min_index) += vectors.row(i);
-      if (i % 10000 == 0) {
-        spdlog::info("IVF iteration: {}/{}", i, vectors.rows());
-      }
+      M(i, indices[i]) = 1;
     }
-    spdlog::info("Belongs to computed");
+
+    for (int i = 0; i < K; i++) {
+      Eigen::Index max_index;
+      dists.col(i).maxCoeff(&max_index);
+      assignment_error[i] = max_index;
+    }
+
+    new_centroids = M.transpose() * vectors;
+
+    Eigen::VectorXf counts = M.colwise().sum();
+
     for (int i = 0; i < K; ++i) {
-      if (cluster_count[i] == 0) {
+      if (counts(i) == 0) {
         spdlog::warn("Cluster {} is empty", i);
+        new_centroids.row(i) = vectors.row(assignment_error[i]);
         // reinitialize the centroid
-        centroids.row(i) = Matrix::Random(1, dimension_);
       } else {
-        new_centroids.row(i) /= cluster_count[i];
+        new_centroids.row(i) /= counts(i);
       }
     }
 
     converged = (centroids - new_centroids).norm() < threshold;
-
+    centroids = new_centroids;
     max_iter--;
   }
 
@@ -160,11 +170,11 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
                100 - max_iter);
 
   // calculate the distance between each vector and the centroid it belongs to
-  data_dist_to_centroids_.clear();
+  dists = computeDistanceMatrix(vectors, centroids);
   for (int i = 0; i < vectors.rows(); ++i) {
-    int centroid_index = indices[i];
-    data_dist_to_centroids_.push_back(
-        (vectors.row(i) - centroids.row(centroid_index)).norm());
+    Eigen::Index min_index;
+    dists.row(i).minCoeff(&min_index);
+    data_dist_to_centroids_.push_back(dists(i, min_index));
   }
   return true;
 }
@@ -180,7 +190,9 @@ auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
 
   // find the nearest centroid
   TopResult nearest_centroids;
+  spdlog::info("probe {} centroids", nprobe);
   getNearestCentroids(nprobe, query_vec, nearest_centroids);
+  spdlog::info("probe {} centroids done", nprobe);
 
   while (!nearest_centroids.empty()) {
     auto [dist, centroid_idx] = nearest_centroids.top();
@@ -190,8 +202,10 @@ auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
     float query_min;
     float width;
     int sum;
+    spdlog::info("scan cluster {} quantizeQuery", centroid_idx);
     auto quantized_query =
         quantizeQuery(transformed_query, centroid_idx, query_min, width, sum);
+    spdlog::info("Quantization completed for centroid {}", centroid_idx);
 
     ScanContext context;
     context.centroid_idx = centroid_idx;
@@ -273,6 +287,7 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
   };
 
   for (int i = 0; i < cluster_size; i++) {
+    // spdlog::info("Processing {}-th element in the cluster", i);
     int data_idx = inverted_index_[context.centroid_idx][i];
     float raw_to_centroid = data_dist_to_centroids_[data_idx];
     float raw_query_to_centroid = context.cluster_dist;
@@ -294,10 +309,10 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
                         raw_query_to_centroid *
                         std::sqrt((1 - x0_val * x0_val) / (x0_val * x0_val));
     estimated_ += 1;
-    auto real_dist = (context.raw_query - raw_data_.row(data_idx)).squaredNorm();
-    if (distance -error_bound > real_dist) {
-      wrong_estimate_++;
-    }
+    // auto real_dist = (context.raw_query - raw_data_.row(data_idx)).squaredNorm();
+    // if (distance -error_bound > real_dist) {
+      // wrong_estimate_++;
+    // }
     rerank_queue.push_back({distance - error_bound, data_idx});
 
     if (rerank_queue.size() == rerank_batch) {
@@ -358,15 +373,16 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
 
 void rabitQ::getNearestCentroids(int nprobe, const Matrix &query,
                                  TopResult &result) {
-  for (int i = 0; i < centroids_.rows(); ++i) {
-    float dist = (query - centroids_.row(i)).norm();
+  auto dist = computeDistanceMatrix(query, centroids_);
+  for (int i = 0; i < dist.cols(); ++i) {
+    auto centroid_dist = dist(0, i);
     if (result.size() < nprobe) {
-      result.push({dist, i});
+      result.push({centroid_dist, i});
     } else {
       auto max_dist = result.top().first;
-      if (dist < max_dist) {
+      if (centroid_dist < max_dist) {
+        result.push({centroid_dist, i});
         result.pop();
-        result.push({dist, i});
       }
     }
   }
