@@ -30,7 +30,7 @@ bool rabitQ::train() {
 
   // 25600 is the default vector number in the cluster
   // cluster_size is the power of 2
-  int cluster_size = roundup(std::max(data_size_ / 25600, 1U), 2);
+  int cluster_size = roundup(std::max(data_size_ / 51200, 1U), 2);
 
   centroids_ = Matrix::Zero(cluster_size, dimension_);
   indices_.resize(data_size_);
@@ -172,9 +172,8 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
   // calculate the distance between each vector and the centroid it belongs to
   dists = computeDistanceMatrix(vectors, centroids);
   for (int i = 0; i < vectors.rows(); ++i) {
-    Eigen::Index min_index;
-    dists.row(i).minCoeff(&min_index);
-    data_dist_to_centroids_.push_back(dists(i, min_index));
+    auto dist = dists.row(i).minCoeff();
+    data_dist_to_centroids_.push_back(std::sqrt(dist));
   }
   return true;
 }
