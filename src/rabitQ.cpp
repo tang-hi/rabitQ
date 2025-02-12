@@ -91,7 +91,8 @@ bool rabitQ::save(const std::string &saved_path) { return false; }
 // TODO: Implement this function
 bool rabitQ::load(const std::string &index_path) { return false; }
 
-auto rabitQ::computeDistanceMatrix(const Matrix &vectors, const Matrix &centroids) -> Matrix {
+auto rabitQ::computeDistanceMatrix(const Matrix &vectors,
+                                   const Matrix &centroids) -> Matrix {
   Eigen::VectorXf vec_sq = vectors.rowwise().squaredNorm();
   Eigen::VectorXf centroid_sq = centroids.rowwise().squaredNorm();
   Matrix dists = -2 * vectors * centroids.transpose();
@@ -153,9 +154,9 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
 
     for (int i = 0; i < K; ++i) {
       if (counts(i) == 0) {
+        // reinitialize the centroid
         spdlog::warn("Cluster {} is empty", i);
         new_centroids.row(i) = vectors.row(assignment_error[i]);
-        // reinitialize the centroid
       } else {
         new_centroids.row(i) /= counts(i);
       }
@@ -170,9 +171,13 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
                100 - max_iter);
 
   // calculate the distance between each vector and the centroid it belongs to
+  data_dist_to_centroids_.clear();
   dists = computeDistanceMatrix(vectors, centroids);
   for (int i = 0; i < vectors.rows(); ++i) {
-    auto dist = dists.row(i).minCoeff();
+    Eigen::Index min_index;
+    auto dist = dists.row(i).minCoeff(&min_index);
+    indices[i] = min_index;
+
     data_dist_to_centroids_.push_back(std::sqrt(dist));
   }
   return true;
@@ -251,26 +256,26 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
   constexpr uint32_t rerank_batch = 32;
   std::vector<std::pair<float, int>> rerank_queue;
 
+  // rerange the query to the codec format
+  auto dim = context.quantized_query.cols();
+  auto query_dim = dim * Bq_ / 64;
+  std::vector<uint64_t> query;
+  for (int i = 0; i < Bq_; i++) {
+    for (int j = 0; j < dim; j += 64) {
+      uint64_t val = 0;
+      for (int k = 0; k < 64; k++) {
+        val |= ((context.quantized_query(0, j + k) & (1 << i)) >> i);
+        if (k != 63) {
+          val <<= 1;
+        }
+      }
+      query.push_back(val);
+    }
+  }
   // TODO(tang-hi): need to optimize the inner product calculation
   auto calculate_inner_product =
-      [this](const BinaryMatrix &quantized_query,
-             const PackedMatrix &quantized_data) -> int {
-    auto dim = quantized_query.cols();
-    auto query_dim = dim * Bq_ / 64;
-    std::vector<uint64_t> query;
-    for (int i = 0; i < Bq_; i++) {
-      for (int j = 0; j < dim; j += 64) {
-        uint64_t val = 0;
-        for (int k = 0; k < 64; k++) {
-          val |= ((quantized_query(0, j + k) & (1 << i)) >> i);
-          if (k != 63) {
-            val <<= 1;
-          }
-        }
-        query.push_back(val);
-      }
-    }
-
+      [&, this](std::vector<uint64_t> &query_codec,
+                const PackedMatrix &quantized_data) -> int {
     int sum = 0;
     int sum1 = 0;
     for (int i = 0; i < Bq_; i++) {
@@ -281,7 +286,6 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
       }
       sum += (sum1 << i);
     }
-
     return sum;
   };
 
@@ -296,7 +300,7 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
                        (2 * popcount_[data_idx] - dimension_);
     float distance_2 =
         context.coeff_2 * raw_to_centroid / x0_val *
-        (2 * calculate_inner_product(context.quantized_query,
+        (2 * calculate_inner_product(query,
                                      packed_codec_.row(data_idx)) -
          context.sum);
 
@@ -308,9 +312,10 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
                         raw_query_to_centroid *
                         std::sqrt((1 - x0_val * x0_val) / (x0_val * x0_val));
     estimated_ += 1;
-    // auto real_dist = (context.raw_query - raw_data_.row(data_idx)).squaredNorm();
-    // if (distance -error_bound > real_dist) {
-      // wrong_estimate_++;
+    // auto real_dist =
+    //     (context.raw_query - raw_data_.row(data_idx)).squaredNorm();
+    // if (distance - error_bound > real_dist) {
+    //   wrong_estimate_++;
     // }
     rerank_queue.push_back({distance - error_bound, data_idx});
 
@@ -374,7 +379,7 @@ void rabitQ::getNearestCentroids(int nprobe, const Matrix &query,
                                  TopResult &result) {
   auto dist = computeDistanceMatrix(query, centroids_);
   for (int i = 0; i < dist.cols(); ++i) {
-    auto centroid_dist = dist(0, i);
+    auto centroid_dist = std::sqrt(dist(0, i));
     if (result.size() < nprobe) {
       result.push({centroid_dist, i});
     } else {

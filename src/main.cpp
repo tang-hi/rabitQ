@@ -70,30 +70,27 @@ int main(int argc, char *argv[]) {
 
   for (size_t i = 0; i < query_data.rows(); ++i) {
     spdlog::info("Processing query {}", i);
-    auto result = rabit.search(K, 10, query_data.row(i).data());
+    auto result = rabit.search(K, 4, query_data.row(i).data());
     while (!result.empty()) {
       auto [dist, idx] = result.top();
       if (ground_truth_set[i].find(idx) != ground_truth_set[i].end()) {
         correct++;
-      } 
+      }
       total_queries++;
       result.pop();
     }
     double recall_rate = static_cast<double>(correct) / total_queries;
     spdlog::info("Query: {} ,Recall Rate: {}", i, recall_rate);
+    // spdlog::info("Wrong estimation: {}",
+    //              float(rabit.wrong_estimate()) / rabit.estimated());
   }
 
   // Load the ground truth
-
-  
 
   double recall_rate = static_cast<double>(correct) / total_queries;
   std::cout << "Recall Rate: " << recall_rate << std::endl;
 
   spdlog::info("Skipped: {}", rabit.skipped());
-
-  // spdlog::info("Wrong estimation: {}",
-  //              float(rabit.wrong_estimate()) / rabit.estimated());
 
   return 0;
 }
