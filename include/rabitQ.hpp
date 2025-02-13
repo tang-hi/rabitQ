@@ -89,7 +89,7 @@ private:
   void packQuantized();
 
   void getNearestCentroids(int nprobe, const Matrix &raw_query,
-                           TopResult &result);
+                           std::vector<std::pair<float, int>> &result);
 
   BinaryMatrix quantizeQuery(const Matrix &query, int centroid_idx,
                              float &query_min, float &width, int &sum);
