@@ -11,7 +11,7 @@
 
 class rabitQ {
 public:
-  using Matrix = Eigen::MatrixXf;
+  using Matrix = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic>;
   using BinaryMatrix =
       Eigen::Matrix<uint8_t, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
 
@@ -60,16 +60,15 @@ public:
 
   bool save(const std::string &saved_path);
 
-  bool load(const std::string &index_path);
-
-  Matrix computeDistanceMatrix(const Matrix &vectors,
-                              const Matrix &centroids);
+  bool load(const std::string &index_path, bool in_memory = true);
 
   int skipped() const { return skip_; }
 
   int wrong_estimate() const { return wrong_estimate_; }
 
   int estimated() const { return estimated_; }
+
+  Matrix getRawData(int idx) ;
 
   TopResult search(int K, int nprobe, float *query);
 
@@ -102,6 +101,8 @@ private:
   // data path is the path to the vector, file format should be fvecs
   std::string data_path_;
 
+  std::string index_path_;
+
   // dimension_ may be larger than the actual dimension of the data
   // because we will pad the data to the nearest multiple of 64.
   // so the quantized data will be a multiple of 64(uint64_t).
@@ -124,8 +125,6 @@ private:
   Matrix transformed_centroids_;
 
   BinaryMatrix binary_data_;
-
-  // Matrix x0_;
 
   uint32_t data_size_;
 
@@ -154,4 +153,14 @@ private:
   int estimated_{0};
 
   std::vector<int> indices_;
+
+  std::vector<float> distance_1_;
+
+  std::vector<float> distance_2_;
+
+  std::vector<float> error_bound_;
+
+  std::FILE* ifs_{nullptr};
+
+  const std::string MAGIC = "RABITQ";
 };

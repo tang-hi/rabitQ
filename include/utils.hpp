@@ -1,8 +1,13 @@
 #pragma once
 #include "Eigen/Dense"
 #include "spdlog/spdlog.h"
+#include <Eigen/src/Core/Matrix.h>
+#include <Eigen/src/Core/util/Constants.h>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <random>
+#include <unordered_map>
 
 /**
  * @brief round up a number to the nearest multiple
@@ -51,6 +56,95 @@ inline int readInt32(std::ifstream &fio) {
   return value;
 }
 
+template <typename T> inline void write(std::FILE *ofs, T value) {
+  std::fwrite(reinterpret_cast<const char *>(&value), sizeof(value), 1, ofs);
+}
+
+template <typename T> inline void read(std::FILE *fio, T &value) {
+  std::fread(reinterpret_cast<char *>(&value), sizeof(value), 1, fio);
+}
+
+template <typename T>
+inline void write(std::FILE *ofs, const std::vector<T> &vec) {
+  write(ofs, vec.size());
+  std::fwrite(reinterpret_cast<const char *>(vec.data()), sizeof(T), vec.size(),
+              ofs);
+}
+
+template <typename T> inline void read(std::FILE *fio, std::vector<T> &vec) {
+  size_t size;
+  std::fread(reinterpret_cast<char *>(&size), sizeof(size), 1, fio);
+  vec.resize(size);
+  std::fread(reinterpret_cast<char *>(vec.data()), size * sizeof(T), 1, fio);
+}
+
+template <typename T>
+inline void
+write(std::FILE *ofs,
+      const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &matrix) {
+  write(ofs, matrix.rows());
+  write(ofs, matrix.cols());
+  std::fwrite(reinterpret_cast<const char *>(matrix.data()),
+              matrix.size() * sizeof(T), 1, ofs);
+}
+
+template <typename T>
+inline void write(std::FILE *ofs,
+                  const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic,
+                                      Eigen::RowMajor> &matrix) {
+  write(ofs, matrix.rows());
+  write(ofs, matrix.cols());
+  std::fwrite(reinterpret_cast<const char *>(matrix.data()),
+              matrix.size() * sizeof(T), 1, ofs);
+}
+
+template <typename T>
+inline void read(std::FILE *fio,
+                 Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic> &matrix) {
+  decltype(matrix.rows()) rows, cols;
+  read(fio, rows);
+  read(fio, cols);
+  matrix.resize(rows, cols);
+  std::fread(reinterpret_cast<char *>(matrix.data()), matrix.size() * sizeof(T),
+              1, fio);
+}
+
+template <typename T>
+inline void read(
+    std::FILE *fio,
+    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> &matrix) {
+  decltype(matrix.rows()) rows, cols;
+  read(fio, rows);
+  read(fio, cols);
+  matrix.resize(rows, cols);
+  std::fread(reinterpret_cast<char *>(matrix.data()), matrix.size() * sizeof(T), 1, fio);
+}
+
+template <typename T>
+inline void write(std::FILE *ofs,
+                  const std::unordered_map<T, std::vector<T>> &data) {
+  write(ofs, data.size());
+  for (const auto &pair : data) {
+    write(ofs, pair.first);
+    write(ofs, pair.second);
+  }
+}
+
+template <typename T>
+inline void read(std::FILE *fio,
+                 std::unordered_map<T, std::vector<T>> &data) {
+  size_t size;
+  read(fio, size);
+  data.clear();
+  for (size_t i = 0; i < size; ++i) {
+    T key;
+    std::vector<T> value;
+    read(fio, key);
+    read(fio, value);
+    data[key] = value;
+  }
+}
+
 /**
  * @brief Load the float vectors from the data path
  *
@@ -92,4 +186,85 @@ loadFvecs(const std::string &data_path) {
     fio.read(reinterpret_cast<char *>(data.row(i).data()), dim * sizeof(float));
   }
   return data;
+}
+
+/**
+ * @brief Compute the distance matrix between vectors and centroids
+ *
+ * @param vectors the vectors
+ * @param centroids the centroids
+ * @return Eigen::MatrixXf the distance matrix
+ */
+inline Eigen::MatrixXf computeDistanceMatrix(const Eigen::MatrixXf &vectors,
+                                             const Eigen::MatrixXf &vectors2) {
+  Eigen::VectorXf vec_sq = vectors.rowwise().squaredNorm();
+  Eigen::VectorXf centroid_sq = vectors2.rowwise().squaredNorm();
+  Eigen::MatrixXf dists = -2 * vectors * vectors2.transpose();
+  dists = dists.colwise() + vec_sq;
+  dists = dists.rowwise() + centroid_sq.transpose();
+
+  // do the sqrt for all the elements in matrix
+  return dists.cwiseSqrt();
+}
+
+/**
+ * @brief Perform the k-means++ initialization
+ *
+ * @param vectors the vectors to cluster
+ * @param K the number of clusters
+ * @param centroids the centroids
+ */
+inline void kmeansPlusPlus(const Eigen::MatrixXf &vectors, int K,
+                           Eigen::MatrixXf &centroids) {
+  const int n = vectors.rows();
+  const int d = vectors.cols();
+  assert(K <= n && "K must be less than or equal to the number of vectors");
+
+  // Initialize random number generator
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<> distrib(0, n - 1);
+  std::uniform_real_distribution<float> distrib_real(0.0, 1.0);
+
+  // Select first centroid randomly
+  int first_idx = distrib(gen);
+  centroids.row(0) = vectors.row(first_idx);
+
+  // Vector to store minimum distances
+  Eigen::VectorXf min_distances(n);
+
+  // Select remaining centroids
+  for (int k = 1; k < K; k++) {
+    // Compute distances to the last added centroid
+    auto dists = computeDistanceMatrix(centroids.row(k - 1), vectors);
+
+    // get the minimum distance for each vector
+    Eigen::VectorXf min_dists = dists.transpose().rowwise().minCoeff();
+
+    // Update minimum distances
+    if (k == 1) {
+      min_distances = min_dists;
+    } else {
+      min_distances = min_distances.cwiseMin(min_dists);
+    }
+
+    // Calculate cumulative probabilities
+    float sum_distances = min_distances.sum();
+    float rand_val = distrib_real(gen) * sum_distances;
+
+    // Select next centroid using weighted probability
+    float cumsum = 0.0;
+    int next_idx = 0;
+    for (int i = 0; i < n; i++) {
+      cumsum += min_distances(i);
+      if (cumsum >= rand_val) {
+        next_idx = i;
+        break;
+      }
+    }
+
+    centroids.row(k) = vectors.row(next_idx);
+  }
+
+  spdlog::info("K-means++ initialization completed with {} centroids", K);
 }

@@ -2,15 +2,20 @@
 #include "Eigen/Dense"
 #include "utils.hpp"
 #include <Eigen/src/Core/Matrix.h>
+#include <Eigen/src/Core/util/Constants.h>
 #include <Eigen/src/Core/util/Meta.h>
 #include <algorithm>
 #include <cassert>
-#include <chrono>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <fcntl.h>
 #include <filesystem>
 #include <queue>
 #include <spdlog/spdlog.h>
+#include <sys/mman.h>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -74,6 +79,19 @@ bool rabitQ::train() {
   // do the popcount for the packed data
   precomputePopcount();
 
+  distance_1_.resize(data_size_);
+  distance_2_.resize(data_size_);
+  error_bound_.resize(data_size_);
+
+  for (int i = 0; i < data_size_; ++i) {
+    auto raw_to_centroid = data_dist_to_centroids_[i];
+    auto x0 = x0_[i];
+    error_bound_[i] = 2 * 1.9 / std::sqrt(static_cast<float>(dimension_ - 1)) *
+                      raw_to_centroid * std::sqrt((1 - x0 * x0) / (x0 * x0));
+    distance_1_[i] = -2 / norm_factor_ * raw_to_centroid / x0 *
+                     (2 * popcount_[i] - dimension_);
+    distance_2_[i] = -2 / norm_factor_ * raw_to_centroid / x0;
+  }
   return true;
 }
 
@@ -86,20 +104,99 @@ void rabitQ::precomputePopcount() {
   }
 }
 
-// TODO: Implement this function
-bool rabitQ::save(const std::string &saved_path) { return false; }
+bool rabitQ::save(const std::string &saved_path) {
+  std::FILE *ofs = std::fopen(saved_path.c_str(), "wb");
+  if (!ofs) {
+    spdlog::error("Failed to open file {}", saved_path);
+    return false;
+  }
 
-// TODO: Implement this function
-bool rabitQ::load(const std::string &index_path) { return false; }
+  // write the MAGIC number
+  std::fwrite(MAGIC.data(), MAGIC.size(), 1, ofs);
 
-auto rabitQ::computeDistanceMatrix(const Matrix &vectors,
-                                   const Matrix &centroids) -> Matrix {
-  Eigen::VectorXf vec_sq = vectors.rowwise().squaredNorm();
-  Eigen::VectorXf centroid_sq = centroids.rowwise().squaredNorm();
-  Matrix dists = -2 * vectors * centroids.transpose();
-  dists = dists.colwise() + vec_sq;
-  dists = dists.rowwise() + centroid_sq.transpose();
-  return dists;
+  // write the dimension
+  write<int>(ofs, dimension_);
+  write(ofs, P_);
+  write(ofs, raw_data_);
+  write(ofs, centroids_);
+  write(ofs, data_dist_to_centroids_);
+  // write(ofs, transformed_data_);
+  // write(ofs, transformed_centroids_);
+  // write(ofs, binary_data_);
+
+  write(ofs, data_size_);
+  write(ofs, packed_codec_);
+  write(ofs, norm_factor_);
+
+  write(ofs, x0_);
+  write(ofs, popcount_);
+
+  write(ofs, u_);
+
+  write(ofs, Bq_);
+  write(ofs, inverted_index_);
+  write(ofs, indices_);
+  write(ofs, distance_1_);
+  write(ofs, distance_2_);
+  write(ofs, error_bound_);
+  std::fclose(ofs);
+  return true;
+}
+
+bool rabitQ::load(const std::string &index_path, bool in_memory) {
+  std::FILE *ifs = std::fopen(index_path.c_str(), "rb");
+  index_path_ = index_path;
+  if (!ifs) {
+    spdlog::error("Failed to open file {}", index_path);
+    return false;
+  }
+
+  std::string magic;
+  magic.resize(MAGIC.size());
+  std::fread(&magic[0], magic.size(), 1, ifs);
+  if (magic != MAGIC) {
+    spdlog::error("Invalid magic number");
+    return false;
+  }
+
+  read(ifs, dimension_);
+  read<float>(ifs, P_);
+  if (in_memory) {
+    read<float>(ifs, raw_data_);
+  } else {
+    decltype(raw_data_.rows()) rows, cols;
+    read(ifs, rows);
+    read(ifs, cols);
+
+    // // get the current position
+    auto offset = std::ftell(ifs);
+    auto data_size = rows * cols * sizeof(float);
+    fseek(ifs, offset + data_size, SEEK_SET);
+    // read<float>(ifs, raw_data_);
+  }
+  read<float>(ifs, centroids_);
+  read<float>(ifs, data_dist_to_centroids_);
+  // read<float>(ifs, transformed_data_);
+  // read<float>(ifs, transformed_centroids_);
+  // read<uint8_t>(ifs, binary_data_);
+
+  read(ifs, data_size_);
+  read<uint64_t>(ifs, packed_codec_);
+  read(ifs, norm_factor_);
+
+  read<float>(ifs, x0_);
+  read<int>(ifs, popcount_);
+
+  read<float>(ifs, u_);
+
+  read(ifs, Bq_);
+  read<int>(ifs, inverted_index_);
+  read<int>(ifs, indices_);
+  read<float>(ifs, distance_1_);
+  read<float>(ifs, distance_2_);
+  read<float>(ifs, error_bound_);
+  fclose(ifs);
+  return true;
 }
 
 /**
@@ -118,6 +215,7 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
                  std::vector<int> &indices) {
   // random initialization of centroids
   centroids = Matrix::Random(K, dimension_);
+  // kmeansPlusPlus(vectors, K, centroids);
 
   // perform k-means clustering
   int max_iter = 100;
@@ -179,7 +277,7 @@ bool rabitQ::ivf(int K, rabitQ::Matrix &vectors, rabitQ::Matrix &centroids,
     auto dist = dists.row(i).minCoeff(&min_index);
     indices[i] = min_index;
 
-    data_dist_to_centroids_.push_back(std::sqrt(dist));
+    data_dist_to_centroids_.push_back(dist);
   }
   return true;
 }
@@ -195,59 +293,96 @@ auto rabitQ::search(int K, int nprobe, float *query) -> TopResult {
 
   // find the nearest centroid
   std::vector<std::pair<float, int>> nearest_centroids;
-  auto start = std::chrono::high_resolution_clock::now();
   getNearestCentroids(nprobe, query_vec, nearest_centroids);
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration =
-      std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-  spdlog::info("Nearest centroid search time: {} us", duration.count());
-  for (auto [dist, centroid_idx] : nearest_centroids) {
-    start = std::chrono::high_resolution_clock::now();
-    // auto [dist, centroid_idx] = nearest_centroids.top();
-    // transformed_query is q^{,} in the paper
-    auto transformed_query = (query_vec - centroids_.row(centroid_idx)) * PT;
-    // nearest_centroids.pop();
-    float query_min;
-    float width;
-    int sum;
-    // spdlog::info("scan cluster {} quantizeQuery", centroid_idx);
-    auto quantized_query =
-        quantizeQuery(transformed_query, centroid_idx, query_min, width, sum);
-    // spdlog::info("Quantization completed for centroid {}", centroid_idx);
+  std::vector<TopResult> results;
+  std::vector<std::thread> threads;
+  results.resize(nprobe);
+  threads.reserve(nprobe);
+  for (int i = 0; i < nprobe; ++i) {
+    threads.emplace_back([&, i] {
+      auto [dist, centroid_idx] = nearest_centroids[i];
+      auto transformed_query = (query_vec - centroids_.row(centroid_idx)) * PT;
+      // nearest_centroids.pop();
+      float query_min;
+      float width;
+      int sum;
+      // spdlog::info("scan cluster {} quantizeQuery", centroid_idx);
+      auto quantized_query =
+          quantizeQuery(transformed_query, centroid_idx, query_min, width, sum);
+      // spdlog::info("Quantization completed for centroid {}", centroid_idx);
 
-    ScanContext context;
-    context.centroid_idx = centroid_idx;
-    context.cluster_dist = dist;
-    context.query_min = query_min;
-    context.width = width;
-    context.sum = sum;
-    context.coeff_1 = -2 * query_min / norm_factor_;
-    context.coeff_2 = -2 * width / norm_factor_;
-    context.error_bound_coeff =
-        2 * 1.9 / std::sqrt(static_cast<float>(dimension_ - 1));
-    context.K = K;
+      ScanContext context;
+      context.centroid_idx = centroid_idx;
+      context.cluster_dist = dist;
+      context.query_min = query_min;
+      context.width = width;
+      context.sum = sum;
+      context.coeff_1 = query_min;
+      context.coeff_2 = width;
+      context.K = K;
 
-    // TODO(tang-hi): maybe we should avoid the copy here
-    context.raw_query = query_vec;
-    context.quantized_query = quantized_query;
-    end = std::chrono::high_resolution_clock::now();
-    duration =
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    spdlog::info("preprocess query time: {} us", duration.count());
-    start = std::chrono::high_resolution_clock::now(); 
-    scanCluster(context, result);
-    end = std::chrono::high_resolution_clock::now();
-    duration =
-        std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-    spdlog::info("scan cluster time: {} us", duration.count());
+      // TODO(tang-hi): maybe we should avoid the copy here
+
+      context.raw_query = query_vec;
+      context.quantized_query = quantized_query;
+      scanCluster(context, results[i]);
+    });
   }
+
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  // merge the results
+  for (auto &res : results) {
+    while (!res.empty()) {
+      auto [dist, idx] = res.top();
+      if (result.size() < K) {
+        result.push({dist, idx});
+      } else {
+        if (dist < result.top().first) {
+          result.pop();
+          result.push({dist, idx});
+        }
+      }
+      res.pop();
+    }
+  }
+  // for (auto [dist, centroid_idx] : nearest_centroids) {
+  //   // auto [dist, centroid_idx] = nearest_centroids.top();
+  //   // transformed_query is q^{,} in the paper
+  //   auto transformed_query = (query_vec - centroids_.row(centroid_idx)) * PT;
+  //   // nearest_centroids.pop();
+  //   float query_min;
+  //   float width;
+  //   int sum;
+  //   // spdlog::info("scan cluster {} quantizeQuery", centroid_idx);
+  //   auto quantized_query =
+  //       quantizeQuery(transformed_query, centroid_idx, query_min, width,
+  //       sum);
+  //   // spdlog::info("Quantization completed for centroid {}", centroid_idx);
+
+  //   ScanContext context;
+  //   context.centroid_idx = centroid_idx;
+  //   context.cluster_dist = dist;
+  //   context.query_min = query_min;
+  //   context.width = width;
+  //   context.sum = sum;
+  //   context.coeff_1 = query_min;
+  //   context.coeff_2 = width;
+  //   context.K = K;
+
+  //   // TODO(tang-hi): maybe we should avoid the copy here
+
+  //   context.raw_query = query_vec;
+  //   context.quantized_query = quantized_query;
+  //   scanCluster(context, result);
+  // }
   return result;
 }
 
 auto rabitQ::quantizeQuery(const Matrix &query, int centroid_idx,
                            float &query_min, float &width, int &sum)
     -> BinaryMatrix {
-  auto start = std::chrono::high_resolution_clock::now();
   query_min = query.minCoeff();
   sum = 0;
   auto query_max = query.maxCoeff();
@@ -261,8 +396,6 @@ auto rabitQ::quantizeQuery(const Matrix &query, int centroid_idx,
     // accumulate the quantized value, reuse the sum variable during the query
     sum += quantized_query(0, i);
   }
-  auto end = std::chrono::high_resolution_clock::now(); 
-  spdlog::info("Quantization query time: {} us", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
   return quantized_query;
 }
 
@@ -275,7 +408,6 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
   auto dim = context.quantized_query.cols();
   auto query_dim = dim * Bq_ / 64;
   std::vector<uint64_t> query;
-  auto start  = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < Bq_; i++) {
     for (int j = 0; j < dim; j += 64) {
       uint64_t val = 0;
@@ -288,15 +420,9 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
       query.push_back(val);
     }
   }
-  auto end = std::chrono::high_resolution_clock::now();
-  spdlog::info("reformat query time: {} us", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-  uint64_t inner_product_time = 0;
-  uint64_t distance_time = 0;
-  // TODO(tang-hi): need to optimize the inner product calculation
   auto calculate_inner_product =
       [&, this](std::vector<uint64_t> &query_codec,
                 const PackedMatrix &quantized_data) -> int {
-    auto s = std::chrono::high_resolution_clock::now();
     int sum = 0;
     int sum1 = 0;
     for (int i = 0; i < Bq_; i++) {
@@ -307,12 +433,8 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
       }
       sum += (sum1 << i);
     }
-    auto e = std::chrono::high_resolution_clock::now();
-    inner_product_time += std::chrono::duration_cast<std::chrono::microseconds>(e - s).count();
     return sum;
   };
-
-  start = std::chrono::high_resolution_clock::now();
 
   for (int i = 0; i < cluster_size; i++) {
     // spdlog::info("Processing {}-th element in the cluster", i);
@@ -321,27 +443,19 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
     float raw_query_to_centroid = context.cluster_dist;
     float x0_val = x0_[data_idx];
 
-    float distance_1 = context.coeff_1 * raw_to_centroid / x0_val *
-                       (2 * popcount_[data_idx] - dimension_);
+    float distance_1 = context.coeff_1 * distance_1_[data_idx];
     float distance_2 =
-        context.coeff_2 * raw_to_centroid / x0_val *
-        (2 * calculate_inner_product(query,
-                                     packed_codec_.row(data_idx)) -
+        context.coeff_2 * distance_2_[data_idx] *
+        (2 * calculate_inner_product(query, packed_codec_.row(data_idx)) -
          context.sum);
 
     float distance = raw_to_centroid * raw_to_centroid +
                      raw_query_to_centroid * raw_query_to_centroid +
                      distance_1 + distance_2;
 
-    float error_bound = context.error_bound_coeff * raw_to_centroid *
-                        raw_query_to_centroid *
-                        std::sqrt((1 - x0_val * x0_val) / (x0_val * x0_val));
+    float error_bound = error_bound_[data_idx] * raw_query_to_centroid;
     estimated_ += 1;
-    // auto real_dist =
-    //     (context.raw_query - raw_data_.row(data_idx)).squaredNorm();
-    // if (distance - error_bound > real_dist) {
-    //   wrong_estimate_++;
-    // }
+
     rerank_queue.push_back({distance - error_bound, data_idx});
 
     if (rerank_queue.size() == rerank_batch) {
@@ -349,24 +463,17 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
       // times
       for (auto &[dist, idx] : rerank_queue) {
         if (result.size() < context.K) {
-          // TODO(tang-hi): compute the real distance in the disk, currently
-          // is in memory
-          start = std::chrono::high_resolution_clock::now();
-          auto real_dist =
-              (context.raw_query - raw_data_.row(idx)).squaredNorm();
-          end = std::chrono::high_resolution_clock::now();
-          distance_time += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+          // TODO(tang-hi): compute the real distance in the disk, currently is
+          // in memory
+          auto real_dist = (context.raw_query - getRawData(idx)).squaredNorm();
           result.push({real_dist, idx});
         } else {
           auto max_dist = result.top().first;
           if (dist < max_dist) {
             // TODO(tang-hi): precompute the real distance in the disk,
             // currently is in memory
-            start = std::chrono::high_resolution_clock::now();
             auto ground_truth =
-                (context.raw_query - raw_data_.row(idx)).squaredNorm();
-            end = std::chrono::high_resolution_clock::now();
-            distance_time += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+                (context.raw_query - getRawData(idx)).squaredNorm();
             if (ground_truth < max_dist) {
               result.push({ground_truth, idx});
               result.pop();
@@ -380,26 +487,19 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
     }
   }
 
-  // process the remaining elements in the rerank_queue
+  // // process the remaining elements in the rerank_queue
   for (auto &[dist, idx] : rerank_queue) {
     if (result.size() < context.K) {
       // TODO(tang-hi): compute the real distance in the disk, currently
       // is in memory
-      start = std::chrono::high_resolution_clock::now();
-      auto real_dist = (context.raw_query - raw_data_.row(idx)).squaredNorm();
-      end = std::chrono::high_resolution_clock::now();
-      distance_time += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+      auto real_dist = (context.raw_query - getRawData(idx)).squaredNorm();
       result.push({real_dist, idx});
     } else {
       auto max_dist = result.top().first;
       if (dist < max_dist) {
         // TODO(tang-hi): compute the real distance in the disk, currently
         // is in memory
-        start = std::chrono::high_resolution_clock::now();
-        auto ground_truth =
-            (context.raw_query - raw_data_.row(idx)).squaredNorm();
-        end = std::chrono::high_resolution_clock::now();
-        distance_time += std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+        auto ground_truth = (context.raw_query - getRawData(idx)).squaredNorm();
         if (ground_truth < max_dist) {
           result.push({ground_truth, idx});
           result.pop();
@@ -409,23 +509,17 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
       }
     }
   }
-
-  end = std::chrono::high_resolution_clock::now();
-  // spdlog::info("Scan cluster time: {} us", std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
-  spdlog::info("Inner product time: {} us", inner_product_time);
-  spdlog::info("Distance time: {} us", distance_time);
 }
 
 void rabitQ::getNearestCentroids(int nprobe, const Matrix &query,
-                                 std::vector<std::pair<float, int>>& result) {
+                                 std::vector<std::pair<float, int>> &result) {
   auto dist = computeDistanceMatrix(query, centroids_);
   for (int i = 0; i < dist.cols(); ++i) {
-    result.push_back({std::sqrt(dist(0, i)), i});
+    result.push_back({dist(0, i), i});
   }
-  std::sort(result.begin(), result.end(),
-            [](const auto &lhs, const auto &rhs) {
-              return lhs.first < rhs.first;
-            });
+  std::sort(result.begin(), result.end(), [](const auto &lhs, const auto &rhs) {
+    return lhs.first < rhs.first;
+  });
   result.resize(nprobe);
 }
 
@@ -482,4 +576,45 @@ void rabitQ::packQuantized() {
       packed_codec_(i, block) = word;
     }
   }
+}
+
+auto rabitQ::getRawData(int idx) -> Matrix {
+  // in memory
+  if (raw_data_.rows() > 0) {
+    return raw_data_.row(idx);
+  }
+  auto fd = open(data_path_.c_str(), O_RDONLY | O_DIRECT);
+  auto ifs = fdopen(fd, "rb");
+  
+  if (!ifs) {
+    spdlog::error("Failed to open file {}", data_path_);
+    return Matrix();
+  }
+  auto vector_size = dimension_ * sizeof(float) + sizeof(int);
+  auto offset = idx * vector_size;
+  if (std::fseek(ifs, offset, SEEK_SET) != 0) {
+    spdlog::error("Failed to seek to the offset {}", offset);
+    return Matrix();
+  }
+
+  int32_t dim;
+  if (std::fread(&dim, sizeof(int), 1, ifs) != 1) {
+    spdlog::error("Failed to read the dimension");
+    return Matrix();
+  }
+
+  if (dim != dimension_) {
+    spdlog::error("Dimension mismatch. Expected: {}, Got: {}", dimension_, dim);
+    return Matrix();
+  }
+
+  Matrix data = Matrix::Zero(1, dimension_);
+
+  if (std::fread(data.data(), sizeof(float), dimension_, ifs) != dimension_) {
+    spdlog::error("Failed to read the data");
+    return Matrix();
+  }
+
+  std::fclose(ifs);
+  return data;
 }
