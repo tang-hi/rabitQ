@@ -56,6 +56,22 @@ public:
     u_ = Matrix::Random(1, dimension_);
   }
 
+  explicit rabitQ(int dimension)
+      : dimension_(dimension),
+        norm_factor_(std::sqrt(static_cast<float>(dimension_))) {
+    if (dimension_ % 64 != 0) {
+      spdlog::warn(
+          "The dimension {} is not a multiple of 64, it will be rounded "
+          "up to the nearest multiple of 64. eg {}",
+          dimension_, roundup(dimension_, 64));
+      dimension_ = roundup(dimension_, 64);
+    }
+    P_ = Matrix::Random(dimension_, dimension_);
+    Eigen::HouseholderQR<Matrix> qr(P_);
+    P_ = qr.householderQ();
+    u_ = Matrix::Random(1, dimension_);
+  }
+
   bool train();
 
   bool save(const std::string &saved_path);
@@ -68,7 +84,7 @@ public:
 
   int estimated() const { return estimated_; }
 
-  Matrix getRawData(int idx) ;
+  Matrix getRawData(int idx);
 
   TopResult search(int K, int nprobe, float *query);
 
@@ -160,7 +176,7 @@ private:
 
   std::vector<float> error_bound_;
 
-  std::FILE* ifs_{nullptr};
+  std::FILE *ifs_{nullptr};
 
   const std::string MAGIC = "RABITQ";
 };

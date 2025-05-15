@@ -437,7 +437,6 @@ void rabitQ::scanCluster(ScanContext &context, TopResult &result) {
   };
 
   for (int i = 0; i < cluster_size; i++) {
-    // spdlog::info("Processing {}-th element in the cluster", i);
     int data_idx = inverted_index_[context.centroid_idx][i];
     float raw_to_centroid = data_dist_to_centroids_[data_idx];
     float raw_query_to_centroid = context.cluster_dist;
